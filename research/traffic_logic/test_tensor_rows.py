@@ -47,6 +47,45 @@ class TensorRowMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "selected index"):
             map_lane_ids_to_rows([7], [7], [1])
 
+    def test_duplicate_selected_indices_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "selected index"):
+            map_lane_ids_to_rows([7, 8], [7, 8], [0, 0])
+
+    def test_selected_indices_outside_both_bounds_are_rejected(self):
+        for selected in ([-1], [2]):
+            with self.subTest(selected=selected):
+                with self.assertRaisesRegex(ValueError, "selected index"):
+                    map_lane_ids_to_rows([7, 8], [7, 8], selected)
+
+    def test_duplicate_lane_permutation_indices_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "lane permutation"):
+            map_lane_ids_to_rows(
+                [7, 8], [7, 8], [0, 1], lane_permutation=[0, 0]
+            )
+
+    def test_lane_permutation_indices_outside_both_bounds_are_rejected(self):
+        for permutation in ([-1, 0], [0, 2]):
+            with self.subTest(permutation=permutation):
+                with self.assertRaisesRegex(ValueError, "lane permutation"):
+                    map_lane_ids_to_rows(
+                        [7, 8], [7, 8], [0, 1],
+                        lane_permutation=permutation,
+                    )
+
+    def test_lane_permutation_length_mismatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "lane permutation length"):
+            map_lane_ids_to_rows(
+                [7, 8], [7, 8], [0, 1], lane_permutation=[0]
+            )
+
+    def test_normalized_duplicate_candidate_lane_ids_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate normalized Lane ID in candidates"):
+            map_lane_ids_to_rows([7, "7"], [7], [0])
+
+    def test_normalized_duplicate_graph_lane_ids_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate normalized Lane ID in graph"):
+            map_lane_ids_to_rows([7], [7, "7"], [0])
+
 
 if __name__ == "__main__":
     unittest.main()
