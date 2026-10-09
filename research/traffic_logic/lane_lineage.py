@@ -29,11 +29,17 @@ def build_lane_lineage(lane_groups, lanes):
         lane_id = _lane_id(raw_id)
         if lane_id in normalized_lanes:
             raise ValueError(f"Duplicate normalized Lane ID: {lane_id}")
+        if len(points) < 2:
+            raise ValueError(f"Source Lane needs at least 2 points: {lane_id}")
         normalized_lanes[lane_id] = points
 
     lineage = {}
+    seen_group_ids = set()
     for raw_group_id, members in lane_groups.items():
         group_id = _lane_id(raw_group_id)
+        if group_id in seen_group_ids:
+            raise ValueError(f"Duplicate normalized Group ID: {group_id}")
+        seen_group_ids.add(group_id)
         offset = 0
         for index, raw_id in enumerate(members):
             lane_id = _lane_id(raw_id)
@@ -42,8 +48,6 @@ def build_lane_lineage(lane_groups, lanes):
             if lane_id not in normalized_lanes:
                 raise KeyError(f"Group member has no source Lane: {lane_id}")
             point_count = len(normalized_lanes[lane_id])
-            if point_count == 0:
-                raise ValueError(f"Source Lane has no points: {lane_id}")
             source_start = 0 if index == 0 else 1
             retained_count = point_count - source_start
             lineage[lane_id] = {

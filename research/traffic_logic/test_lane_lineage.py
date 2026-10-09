@@ -76,6 +76,28 @@ class LaneLineageTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             build_lane_lineage({7: [101, 404]}, self.lanes)
 
+    def test_single_point_first_lane_is_rejected(self):
+        lanes = dict(self.lanes)
+        lanes[101] = [(0, 0)]
+        with self.assertRaisesRegex(ValueError, "at least 2 points.*101"):
+            build_lane_lineage(self.groups, lanes)
+
+    def test_single_point_later_lane_is_rejected_before_empty_interval(self):
+        lanes = dict(self.lanes)
+        lanes["102"] = [(2, 0)]
+        with self.assertRaisesRegex(ValueError, "at least 2 points.*102"):
+            build_lane_lineage(self.groups, lanes)
+
+    def test_single_point_ungrouped_source_lane_is_rejected(self):
+        lanes = dict(self.lanes)
+        lanes[404] = [(9, 0)]
+        with self.assertRaisesRegex(ValueError, "at least 2 points.*404"):
+            build_lane_lineage(self.groups, lanes)
+
+    def test_normalized_group_ids_must_be_unique(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate normalized Group ID: 7"):
+            build_lane_lineage({7: [101], "7": [102]}, self.lanes)
+
 
 if __name__ == "__main__":
     unittest.main()
