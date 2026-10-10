@@ -16,7 +16,8 @@ from .e4d_real_anchor_diagnostic import (
     e3c_baselines,
 )
 from .real_scenario_helpers import parse_scenario, read_tfrecord_record
-from .signal_lane_sidecar import (SCHEMA_NAME, SCHEMA_VERSION, STATE_NAMES,
+from .signal_lane_sidecar import (SCHEMA_NAME, SCHEMA_VERSION,
+                                  LEGACY_STATE_NAMES as STATE_NAMES,
                                   dumps_sidecar, loads_sidecar,
                                   verify_evidence_files)
 

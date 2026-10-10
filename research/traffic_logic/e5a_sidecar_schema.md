@@ -1,5 +1,7 @@
 # E5-A Signal–Lane Sidecar 契约
 
+本文保留 v1.0.0 的字段和校验语义；E5-A.1 的 v1.1.0 扩展见 [e5a1_sidecar_schema.md](e5a1_sidecar_schema.md)。加载旧 JSON 不会自动迁移。
+
 `schema_name=scenario-dreamer.signal-lane-sidecar`、`schema_version=1.0.0`。这是独立研究 JSON；每份文件只对应一个 `(scenario_id, record_index, time_index)`，不改变道路张量或模型接口。`model_condition_injected` 在本版本必须为 `false`。
 
 ## 字段和来源

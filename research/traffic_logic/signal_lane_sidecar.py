@@ -13,10 +13,17 @@ import re
 
 SCHEMA_NAME = "scenario-dreamer.signal-lane-sidecar"
 SCHEMA_VERSION = "1.0.0"
-STATE_NAMES = {0: "UNKNOWN", 1: "ARROW_STOP", 4: "STOP"}
+SCHEMA_VERSION_1_1 = "1.1.0"
+LEGACY_STATE_NAMES = {0: "UNKNOWN", 1: "ARROW_STOP", 4: "STOP"}
+STATE_NAMES = {
+    0: "UNKNOWN", 1: "ARROW_STOP", 2: "ARROW_CAUTION",
+    3: "ARROW_GO", 4: "STOP", 5: "CAUTION", 6: "GO",
+    7: "FLASHING_STOP", 8: "FLASHING_CAUTION",
+}
 AUDIT_STATUSES = frozenset((
     "verified", "partial", "uncertain", "filtered", "invalid", "not_run"))
 FOV_STATUSES = AUDIT_STATUSES | {"retained"}
+LOCAL_SOURCE_STATUSES = AUDIT_STATUSES | {"retained"}
 ROW_STATUSES = frozenset(("retained", "filtered"))
 
 
@@ -69,7 +76,7 @@ def _artifact_ref(refs, field, evidence, *, expected, required):
         raise ValueError(f"Invalid {field} evidence role or digest")
 
 
-def _validate_row(row, path):
+def _validate_row(row, path, version):
     row_index = _field(row, "tensor_row", path)
     status = _field(row, "row_status", path)
     _status(status, ROW_STATUSES, f"{path}.row")
@@ -82,14 +89,16 @@ def _validate_row(row, path):
             raise ValueError(f"{path}: present row must be retained")
     local_source = _field(row, "local_lane_source_status", path)
     stop_source = _field(row, "stop_identity_status", path)
-    _status(local_source, AUDIT_STATUSES, f"{path}.local_lane_source")
+    local_statuses = (LOCAL_SOURCE_STATUSES if version == SCHEMA_VERSION_1_1
+                      else AUDIT_STATUSES)
+    _status(local_source, local_statuses, f"{path}.local_lane_source")
     _status(stop_source, AUDIT_STATUSES, f"{path}.stop_identity")
     if status == "filtered" and (local_source not in ("filtered", "not_run")
                                  or stop_source not in ("filtered", "not_run")):
         raise ValueError(f"{path}: filtered row cannot claim retained source")
 
 
-def _validate_signal(record, document, raw_ids, evidence):
+def _validate_signal(record, document, raw_ids, evidence, version):
     raw_id = _nonnegative_int(_field(record, "raw_lane_id", "signal"),
                               "signal.raw_lane_id")
     if raw_id not in raw_ids:
@@ -105,10 +114,30 @@ def _validate_signal(record, document, raw_ids, evidence):
         raise ValueError("A Sidecar signal record must have presence=present")
     code = _nonnegative_int(_field(signal, "state_code", "signal"),
                             "signal.state_code")
-    if STATE_NAMES.get(code) != _field(signal, "state_name", "signal"):
+    state_names = (STATE_NAMES if version == SCHEMA_VERSION_1_1
+                   else LEGACY_STATE_NAMES)
+    if state_names.get(code) != _field(signal, "state_name", "signal"):
         raise ValueError(f"Unsupported or mismatched signal state for Lane {raw_id}")
     stop = _field(signal, "stop_point_global_xyz", "signal")
     _finite_vector(stop, 3, "signal.stop_point_global_xyz")
+
+    if version == SCHEMA_VERSION_1_1:
+        mapping_status = _field(record, "mapping_audit_status", f"signal[{raw_id}]")
+        if mapping_status not in ("not_run", "verified"):
+            raise ValueError(f"Invalid Lane {raw_id} mapping_audit_status")
+        if mapping_status == "not_run":
+            if any(_field(record, key, f"signal[{raw_id}]") is not None
+                   for key in ("compact", "anchor", "fov", "road_tensor")):
+                raise ValueError(f"Lane {raw_id} not_run mapping carries road claims")
+            refs = _field(record, "evidence_refs", f"signal[{raw_id}]")
+            if _field(refs, "raw_signal", "evidence_refs") != "record_payload":
+                raise ValueError("Missing raw signal evidence reference")
+            if any(_field(refs, key, "evidence_refs") is not None for key in
+                   ("group_and_rows", "anchor", "stop_fov", "final_stop")):
+                raise ValueError(f"Lane {raw_id} not_run mapping cites road evidence")
+            return
+        if document["mapping_evidence_time_index"] != document["time_index"]:
+            raise ValueError("mapping_evidence_time_index differs from signal audit")
 
     compact = _field(record, "compact", f"signal[{raw_id}]")
     group_id = _nonnegative_int(_field(compact, "group_id", "compact"),
@@ -223,7 +252,7 @@ def _validate_signal(record, document, raw_ids, evidence):
     regular = _field(tensor, "regular", "road_tensor")
     if _field(regular, "lane_id", "road_tensor.regular") != group_id:
         raise ValueError(f"Lane {raw_id} Regular lane ID differs from Group ID")
-    _validate_row(regular, "road_tensor.regular")
+    _validate_row(regular, "road_tensor.regular", version)
     children = _field(tensor, "partitioned", "road_tensor")
     if not isinstance(children, list) or not children:
         raise ValueError(f"Lane {raw_id} needs Partitioned child records")
@@ -236,7 +265,7 @@ def _validate_signal(record, document, raw_ids, evidence):
         seen_children.add(child_id)
         _point_range(_field(child, "parent_upsampled_point_range", "partitioned"),
                      "partitioned.parent_upsampled_point_range")
-        _validate_row(child, f"partitioned[{child_id}]")
+        _validate_row(child, f"partitioned[{child_id}]", version)
     final_status = _field(tensor, "final_stop_identity_status", "road_tensor")
     _status(final_status, AUDIT_STATUSES, "road_tensor.final_stop_identity")
     final_verified = _field(tensor, "final_tensor_stop_provenance_verified",
@@ -281,26 +310,52 @@ def validate_sidecar(document, *, expected_scenario_id=None,
     """Reject mixed contexts, unsupported semantics and unsupported claims."""
     if _field(document, "schema_name", "sidecar") != SCHEMA_NAME:
         raise ValueError("Unsupported Sidecar schema_name")
-    if _field(document, "schema_version", "sidecar") != SCHEMA_VERSION:
+    version = _field(document, "schema_version", "sidecar")
+    if version not in (SCHEMA_VERSION, SCHEMA_VERSION_1_1):
         raise ValueError("Unsupported Sidecar schema_version")
     scenario_id = _field(document, "scenario_id", "sidecar")
     if not isinstance(scenario_id, str) or not scenario_id:
         raise ValueError("scenario_id must be a nonempty string")
     _nonnegative_int(_field(document, "record_index", "sidecar"),
                      "record_index")
-    _nonnegative_int(_field(document, "time_index", "sidecar"), "time_index")
+    time_index = _nonnegative_int(_field(document, "time_index", "sidecar"),
+                                  "time_index")
     current_time_index = _nonnegative_int(
         _field(document, "current_time_index", "sidecar"),
         "current_time_index")
-    if current_time_index != document["time_index"]:
-        raise ValueError("current_time_index differs from audited time_index")
+    if version == SCHEMA_VERSION:
+        if current_time_index != time_index:
+            raise ValueError("current_time_index differs from audited time_index")
+    else:
+        count = _nonnegative_int(
+            _field(document, "dynamic_map_states_count", "sidecar"),
+            "dynamic_map_states_count")
+        if count == 0 or time_index >= count or current_time_index >= count:
+            raise ValueError("time_index/current_time_index outside dynamic_map_states")
+        role = ("history" if time_index < current_time_index else
+                "future_label" if time_index > current_time_index else
+                "current")
+        if _field(document, "temporal_role", "sidecar") != role:
+            raise ValueError("temporal_role differs from Scenario time indices")
+        if _field(document, "available_at_observation_cutoff", "sidecar") is not (
+                time_index <= current_time_index):
+            raise ValueError("available_at_observation_cutoff differs from time role")
+        mapping_time = _field(document, "mapping_evidence_time_index", "sidecar")
+        if mapping_time is not None:
+            _nonnegative_int(mapping_time, "mapping_evidence_time_index")
+            if mapping_time != time_index:
+                raise ValueError("mapping_evidence_time_index differs from audit time")
     _hex(_field(document, "record_payload_sha256", "sidecar"), 64,
          "record_payload_sha256")
     _hex(_field(document, "official_repo_commit", "sidecar"), 40,
          "official_repo_commit")
     if _field(document, "coordinate_frame", "sidecar") != "waymo_global_xyz":
         raise ValueError("Sidecar needs waymo_global_xyz coordinates")
-    if _field(document, "row_index_stage", "sidecar") != "pre_training_random_permutation":
+    row_stage = _field(document, "row_index_stage", "sidecar")
+    if version == SCHEMA_VERSION_1_1 and mapping_time is None:
+        if row_stage is not None:
+            raise ValueError("row_index_stage must be null without road mapping")
+    elif row_stage != "pre_training_random_permutation":
         raise ValueError("Road rows must identify their pre-shuffle stage")
     if _field(document, "model_condition_injected", "sidecar") is not False:
         raise ValueError("model_condition_injected must be false in Sidecar v1")
@@ -321,7 +376,8 @@ def validate_sidecar(document, *, expected_scenario_id=None,
             raise ValueError("official_source_blobs has empty source name")
         _hex(digest, 40, f"official_source_blobs.{name}")
     evidence = _field(document, "evidence_sha256", "sidecar")
-    if not isinstance(evidence, dict) or "e4a" not in evidence:
+    if not isinstance(evidence, dict) or (version == SCHEMA_VERSION and
+                                           "e4a" not in evidence):
         raise ValueError("Missing E4-A evidence digest")
     for name, digest in evidence.items():
         if not isinstance(name, str) or not name:
@@ -348,11 +404,13 @@ def validate_sidecar(document, *, expected_scenario_id=None,
     group_signatures = {}
     raw_ids = set(raw_lane_ids)
     for record in records:
-        _validate_signal(record, document, raw_ids, evidence)
+        _validate_signal(record, document, raw_ids, evidence, version)
         raw_id = record["raw_lane_id"]
         if raw_id in seen:
             raise ValueError(f"Duplicate raw signal Lane {raw_id}")
         seen.add(raw_id)
+        if version == SCHEMA_VERSION_1_1 and record["mapping_audit_status"] == "not_run":
+            continue
         group_id = record["compact"]["group_id"]
         regular = record["road_tensor"]["regular"]
         children = record["road_tensor"]["partitioned"]
@@ -367,6 +425,13 @@ def validate_sidecar(document, *, expected_scenario_id=None,
         if group_id in group_signatures and signature != group_signatures[group_id]:
             raise ValueError(f"Group {group_id} has inconsistent members or rows")
         group_signatures[group_id] = signature
+    if version == SCHEMA_VERSION_1_1:
+        mapped = any(record["mapping_audit_status"] != "not_run"
+                     for record in records)
+        if mapped != (document["mapping_evidence_time_index"] is not None):
+            raise ValueError("mapping_evidence_time_index must match mapping audit")
+        if not mapped and evidence:
+            raise ValueError("not_run mapping cannot carry E4 evidence files")
 
 
 def dumps_sidecar(document):
@@ -413,17 +478,73 @@ def signal_for_lane(document, lane_id):
                  if record["raw_lane_id"] == lane_id), None)
 
 
+def verify_original_time_axis(document, record_payload):
+    """Bind v1.1 time bounds to the original Scenario Proto, read-only."""
+    validate_sidecar(document)
+    if document["schema_version"] != SCHEMA_VERSION_1_1:
+        raise ValueError("Original time-axis verification needs Schema v1.1.0")
+    if not isinstance(record_payload, bytes):
+        raise ValueError("record_payload must be bytes")
+    if hashlib.sha256(record_payload).hexdigest() != document[
+            "record_payload_sha256"]:
+        raise ValueError("record_payload_sha256 differs from original Proto")
+    from .real_scenario_helpers import _fields, parse_scenario
+
+    scenario = parse_scenario(record_payload, document["time_index"])
+    if scenario["scenario_id"] != document["scenario_id"]:
+        raise ValueError("scenario_id differs from original Proto")
+    if scenario["current_time_index"] != document["current_time_index"]:
+        raise ValueError("current_time_index differs from original Proto")
+    count = scenario["dynamic_state_count"]
+    if count != document["dynamic_map_states_count"]:
+        raise ValueError("dynamic_map_states_count differs from original Proto")
+    timestamp_count = 0
+    for number, wire, value in _fields(record_payload):
+        if number != 1:
+            continue
+        if wire == 1:
+            timestamp_count += 1
+        elif wire == 2 and len(value) % 8 == 0:
+            timestamp_count += len(value) // 8
+        else:
+            raise ValueError("Invalid timestamps_seconds encoding")
+    if timestamp_count != count:
+        raise ValueError("timestamps_seconds and dynamic_map_states lengths differ")
+    return count
+
+
 def verify_evidence_files(document, base_dir):
-    """Rehash referenced files; ``loads_sidecar`` alone checks structure only."""
+    """Rehash files and bind v1.1 road evidence to its audited time."""
     validate_sidecar(document)
     base = Path(base_dir).absolute()
     digests = {}
+    contents = {}
     for artifact, relative_path in document["evidence_paths"].items():
         path = base / relative_path
         if not path.is_file():
             raise ValueError(f"{artifact} evidence file is missing: {path}")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
         if digest != document["evidence_sha256"][artifact]:
             raise ValueError(f"{artifact} evidence digest differs: {path}")
         digests[artifact] = digest
+        contents[artifact] = content
+    if document["schema_version"] == SCHEMA_VERSION_1_1:
+        used = {value for record in document["signals"]
+                for value in record["evidence_refs"].values()
+                if value in ("e4a", "e4b", "e4c", "e4d")}
+        for artifact in sorted(used):
+            try:
+                source = json.loads(contents[artifact].decode("utf-8"),
+                                    object_pairs_hook=_unique_pairs,
+                                    parse_constant=_invalid_constant)
+            except (UnicodeError, ValueError) as error:
+                raise ValueError(f"{artifact} evidence is not valid JSON") from error
+            if artifact in ("e4a", "e4b"):
+                source = _field(source, "input", f"{artifact} evidence")
+            for field in ("scenario_id", "record_index", "time_index",
+                          "record_payload_sha256"):
+                if _field(source, field, f"{artifact} evidence") != document[field]:
+                    raise ValueError(
+                        f"{artifact} evidence {field} differs from audit time/context")
     return digests
