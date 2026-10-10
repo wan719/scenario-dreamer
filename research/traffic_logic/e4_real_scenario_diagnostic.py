@@ -166,7 +166,7 @@ def capture_official_rows(dataset_class, proxy, graph, num_points, max_lanes):
     }
 
 
-def run(tfrecord, repo, time_index=10):
+def run(tfrecord, repo, time_index=10, observer=None):
     """Run the complete read-only E4-A trace on a single Scenario record."""
     if time_index != 10:
         raise ValueError("This verified E4-A scenario requires time_index=10")
@@ -570,6 +570,24 @@ def run(tfrecord, repo, time_index=10):
 
     def strip_road_points(branch):
         return {key: value for key, value in branch.items() if key != "road_points"}
+
+    if observer is not None:
+        observer({
+            "proto": proto,
+            "processed": processed,
+            "groups": groups,
+            "lineage": lineage,
+            "compact": compact,
+            "normalized": normalized,
+            "fov_masks": masks,
+            "fov": fov,
+            "partitioned": partitioned,
+            "partition_plan": partition_plan,
+            "regular_rows": regular_rows,
+            "partitioned_rows": partition_rows,
+            "normalize_dict": normalize_dict,
+            "cfg": cfg,
+        })
 
     return {
         "run_status": "pass",
