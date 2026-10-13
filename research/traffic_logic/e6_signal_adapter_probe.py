@@ -260,6 +260,98 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
     return report, artifacts
 
 
+def load_verified_baseline(baseline, device, report=None):
+    """Load the witnessed EMA model and exact input evidence without learning."""
+    baseline = Path(baseline).resolve()
+    report = {} if report is None else report
+    code = Path(__file__).resolve().parents[2]
+    for name in ("SCRATCH_ROOT", "DATASET_ROOT"):
+        os.environ[name] = str(baseline.parent.parent)
+    os.environ["PROJECT_ROOT"] = str(code)
+    metadata = json.loads((baseline / "model_base_report.json").read_text())
+    if metadata["status"] != "pretrained_regular_forward_verified":
+        raise ValueError("Baseline forward is not verified")
+    if metadata["scenario_id"] != "637f20cafde22ff8" or metadata["time_index"] != 10:
+        raise ValueError("Expected the witnessed record0/t10 scenario")
+    for relative, expected in metadata["source_git_blobs"].items():
+        actual = subprocess.check_output(["git", "hash-object", relative], cwd=code, text=True).strip()
+        if actual != expected:
+            raise ValueError("Baseline source changed: " + relative)
+    torch.set_num_threads(1)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable to this Python environment")
+    checkpoint_path = Path(metadata["ldm_checkpoint"]["path"])
+    if sha256(checkpoint_path) != metadata["ldm_checkpoint"]["sha256"]:
+        raise ValueError("Pretrained checkpoint changed")
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    cfg = copy.deepcopy(ckpt["hyper_parameters"]["cfg"])
+    if not OmegaConf.is_config(cfg):
+        cfg = OmegaConf.create(cfg)
+    with open_dict(cfg.dataset):
+        cfg.dataset.num_map_ids = int(metadata["official_num_map_ids"])
+    state = {key[len("diff_model."):]: value for key, value in ckpt["state_dict"].items()
+             if key.startswith("diff_model.")}
+    actual_shape = tuple(state["model.scene_type_embedder.embedding_table.weight"].shape)
+    expected_shape = (2 * int(cfg.dataset.num_map_ids) + int(cfg.model.label_dropout > 0),
+                      int(cfg.model.hidden_dim))
+    if actual_shape != expected_shape:
+        raise ValueError("Incompatible scene label table")
+    ldm = LDM(cfg)
+    ldm.load_state_dict(state, strict=True)
+    ema = ExponentialMovingAverage(ldm.parameters(), decay=cfg.train.ema_decay)
+    ema.load_state_dict(ckpt["ema_state_dict"])
+    ema.copy_to()
+    ldm.to(device).eval().requires_grad_(False)
+    del state, ckpt, ema
+    gc.collect()
+    with np.load(baseline / "regular_latents_and_conditions.npz", allow_pickle=False) as saved:
+        arrays = {key: saved[key].copy() for key in saved.files}
+    source_path = Path(metadata["previous_output_dir"]) / "regular_latents_and_conditions.npz"
+    if sha256(source_path) != metadata["ae_latent_source_sha256"]:
+        raise ValueError("Original AE latent evidence changed")
+    with np.load(source_path, allow_pickle=False) as original:
+        if set(original.files) != set(arrays) or not all(
+                np.array_equal(original[key], arrays[key]) for key in original.files):
+            raise ValueError("Resume arrays differ from original encoded evidence")
+    if (arrays["signal_point_mask"].shape != (12, 24, 20)
+            or int(arrays["signal_point_mask"].sum()) != 53
+            or int(arrays["signal_active"].sum()) != 6
+            or not np.all(arrays["signal_batch_index"] == 0)):
+        raise ValueError("Expected the six regular signals and 53 retained points")
+    reference = torch.load(baseline / "ldm_forward_cpu.pt", map_location="cpu")
+    if reference["data"].num_graphs != 1 or reference["data"]["lg_type"].tolist() != [0]:
+        raise ValueError("Probe supports only this single regular sample")
+    stats_path = Path(metadata['latent_stats']['path'])
+    if sha256(stats_path) != metadata['latent_stats']['sha256']:
+        raise ValueError('Latent statistics evidence changed')
+    stats = pickle.loads(stats_path.read_bytes())
+    for key, value in metadata['latent_stats']['values'].items():
+        if not np.allclose(np.asarray(stats[key]), np.asarray(value), rtol=1e-6, atol=1e-8):
+            raise ValueError('Recorded latent statistics differ from evidence')
+    validate_reference(reference, arrays, stats, cfg)
+    report['reference_latent_routing_verified'] = True
+    condition = (
+        torch.from_numpy(arrays["signal_features"]).float(),
+        torch.from_numpy(arrays["signal_point_mask"]).bool(),
+        torch.from_numpy(arrays["road_points"]).float(),
+        torch.from_numpy(arrays["signal_active"]).bool()
+    )
+    report.update({"git_commit": subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=code, text=True).strip(),
+        "scenario_id": metadata["scenario_id"], "time_index": 10,
+        "ldm_checkpoint": metadata["ldm_checkpoint"], "ldm_weight_view": "checkpoint EMA",
+        "condition_npz_sha256": sha256(baseline / "regular_latents_and_conditions.npz"),
+        "reference_forward_sha256": sha256(baseline / "ldm_forward_cpu.pt"),
+        "torch_version": torch.__version__, "active_signal_count": 6,
+        "valid_point_count": 53, "verification_scope": "one-scene signal interface and learning probe"})
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        report["gpu"] = torch.cuda.get_device_name()
+    return ldm, reference, condition, metadata, arrays, stats
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-dir", type=Path, required=True)
@@ -276,91 +368,7 @@ def main():
     try:
         if args.steps < 1 or not 0 < args.learning_rate <= 0.1:
             raise ValueError("Invalid probe budget")
-        code = Path(__file__).resolve().parents[2]
-        for name in ("SCRATCH_ROOT", "DATASET_ROOT"):
-            os.environ[name] = str(baseline.parent.parent)
-        os.environ["PROJECT_ROOT"] = str(code)
-        metadata = json.loads((baseline / "model_base_report.json").read_text())
-        if metadata["status"] != "pretrained_regular_forward_verified":
-            raise ValueError("Baseline forward is not verified")
-        if metadata["scenario_id"] != "637f20cafde22ff8" or metadata["time_index"] != 10:
-            raise ValueError("Expected the witnessed record0/t10 scenario")
-        for relative, expected in metadata["source_git_blobs"].items():
-            actual = subprocess.check_output(["git", "hash-object", relative], cwd=code, text=True).strip()
-            if actual != expected:
-                raise ValueError("Baseline source changed: " + relative)
-        torch.set_num_threads(1)
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        if args.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA is unavailable to this Python environment")
-        checkpoint_path = Path(metadata["ldm_checkpoint"]["path"])
-        if sha256(checkpoint_path) != metadata["ldm_checkpoint"]["sha256"]:
-            raise ValueError("Pretrained checkpoint changed")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        cfg = copy.deepcopy(ckpt["hyper_parameters"]["cfg"])
-        if not OmegaConf.is_config(cfg):
-            cfg = OmegaConf.create(cfg)
-        with open_dict(cfg.dataset):
-            cfg.dataset.num_map_ids = int(metadata["official_num_map_ids"])
-        state = {key[len("diff_model."):]: value for key, value in ckpt["state_dict"].items()
-                 if key.startswith("diff_model.")}
-        actual_shape = tuple(state["model.scene_type_embedder.embedding_table.weight"].shape)
-        expected_shape = (2 * int(cfg.dataset.num_map_ids) + int(cfg.model.label_dropout > 0),
-                          int(cfg.model.hidden_dim))
-        if actual_shape != expected_shape:
-            raise ValueError("Incompatible scene label table")
-        ldm = LDM(cfg)
-        ldm.load_state_dict(state, strict=True)
-        ema = ExponentialMovingAverage(ldm.parameters(), decay=cfg.train.ema_decay)
-        ema.load_state_dict(ckpt["ema_state_dict"])
-        ema.copy_to()
-        ldm.to(args.device).eval().requires_grad_(False)
-        del state, ckpt, ema
-        gc.collect()
-        with np.load(baseline / "regular_latents_and_conditions.npz", allow_pickle=False) as saved:
-            arrays = {key: saved[key].copy() for key in saved.files}
-        source_path = Path(metadata["previous_output_dir"]) / "regular_latents_and_conditions.npz"
-        if sha256(source_path) != metadata["ae_latent_source_sha256"]:
-            raise ValueError("Original AE latent evidence changed")
-        with np.load(source_path, allow_pickle=False) as original:
-            if set(original.files) != set(arrays) or not all(
-                    np.array_equal(original[key], arrays[key]) for key in original.files):
-                raise ValueError("Resume arrays differ from original encoded evidence")
-        if (arrays["signal_point_mask"].shape != (12, 24, 20)
-                or int(arrays["signal_point_mask"].sum()) != 53
-                or int(arrays["signal_active"].sum()) != 6
-                or not np.all(arrays["signal_batch_index"] == 0)):
-            raise ValueError("Expected the six regular signals and 53 retained points")
-        reference = torch.load(baseline / "ldm_forward_cpu.pt", map_location="cpu")
-        if reference["data"].num_graphs != 1 or reference["data"]["lg_type"].tolist() != [0]:
-            raise ValueError("Probe supports only this single regular sample")
-        stats_path = Path(metadata['latent_stats']['path'])
-        if sha256(stats_path) != metadata['latent_stats']['sha256']:
-            raise ValueError('Latent statistics evidence changed')
-        stats = pickle.loads(stats_path.read_bytes())
-        for key, value in metadata['latent_stats']['values'].items():
-            if not np.allclose(np.asarray(stats[key]), np.asarray(value), rtol=1e-6, atol=1e-8):
-                raise ValueError('Recorded latent statistics differ from evidence')
-        validate_reference(reference, arrays, stats, cfg)
-        report['reference_latent_routing_verified'] = True
-        condition = (
-            torch.from_numpy(arrays["signal_features"]).float(),
-            torch.from_numpy(arrays["signal_point_mask"]).bool(),
-            torch.from_numpy(arrays["road_points"]).float(),
-            torch.from_numpy(arrays["signal_active"]).bool()
-        )
-        report.update({"git_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=code, text=True).strip(),
-            "scenario_id": metadata["scenario_id"], "time_index": 10,
-            "ldm_checkpoint": metadata["ldm_checkpoint"], "ldm_weight_view": "checkpoint EMA",
-            "condition_npz_sha256": sha256(baseline / "regular_latents_and_conditions.npz"),
-            "reference_forward_sha256": sha256(baseline / "ldm_forward_cpu.pt"),
-            "torch_version": torch.__version__, "active_signal_count": 6,
-            "valid_point_count": 53, "verification_scope": "one-scene signal interface and learning probe"})
-        if args.device == "cuda":
-            torch.cuda.reset_peak_memory_stats()
-            report["gpu"] = torch.cuda.get_device_name()
+        ldm, reference, condition, _, _, _ = load_verified_baseline(baseline, args.device, report)
         _, artifacts = run_learning_probe(
             ldm, reference, condition, args.steps, args.learning_rate, args.seed, progress=report)
         torch.save(artifacts, out / "adapter_probe.pt")

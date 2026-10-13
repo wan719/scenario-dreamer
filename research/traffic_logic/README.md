@@ -53,3 +53,22 @@ OMP_NUM_THREADS=1 /root/autodl-tmp/conda-envs/scenario-dreamer/bin/python -m res
 条件响应采用原版、训练后、合成GO三组各3次前向；车辆输出的组内两两最大差记为jitter，门槛为max(1e-5, 5×三组最大jitter)。原版→训练后、训练后→合成GO的全部跨组配对差异（每对取最大绝对差）的最小值都必须超过门槛。否则保存已训练adapter与预测，报告signal_adapter_probe_no_state_response。三组重复预测、实测波动、门槛和差异均留存；本条件只是保守接口探测，三次重复不能给出统计显著性或泛化结论。
 
 成功标志`signal_adapter_probe_verified`仅表示模型实际读取条件、分支可学习且对合成灯态扰动有响应。训练目标是固定时间步、AE均值latent、固定道路下的车辆epsilon MSE，并非官方完整训练协议。GO扰动是接口敏感性测试；单场景六条停止类信号不能证明交通遵循、生成质量或闯红灯率，代码不执行完整采样。原模型参数冻结，`weights_updated`仅指adapter。
+
+## E7：已训练adapter的完整采样与AE解码对照
+
+`e7_signal_sampling_probe.py`复用E6核验过的EMA权重、输入与已保存adapter，运行原`LDM.p_sample_loop(mode='lane_conditioned')`全部扩散步，采用checkpoint原有CFG和时间步设置。条件调用挂接信号，CFG无条件调用不挂接；退出或失败恢复原模型。原采样循环、AE与坐标还原源码未修改。E6加载逻辑抽成`load_verified_baseline`共用，不重复训练。
+
+同一道路、同一个seed比较原版、原停止类信号adapter、合成GO adapter，额外跑一次原版重复作为累计数值波动参照。逐调用核对Torch CPU/CUDA RNG状态、初始车辆噪声及最终RNG状态；每步恢复的道路latent必须精确等于给定道路。三个条件只改变adapter启用及active灯态，初始和各步采样噪声保持配对。
+
+通过原`AutoEncoder.forward_decoder`及`unnormalize_latents/unnormalize_scene`还原物理状态。保存CSV（位置米、速度米/秒、环绕处理的朝向角差），以及生成场景/latent、完整随机状态摘要和SVG场景图。车辆对比按latent slot，不视为真实track身份。解码道路可能因车辆latent交互而偏移，报告同时保留道路差异、FoV外点、非正尺寸和近零方向向量诊断。
+
+```bash
+OMP_NUM_THREADS=1 /root/autodl-tmp/conda-envs/scenario-dreamer/bin/python -m research.traffic_logic.e7_signal_sampling_probe \
+  --baseline-dir /root/autodl-tmp/e5e_t10_2xe3rd_i/model_resume_3744mega \
+  --adapter-dir /root/autodl-tmp/e5e_t10_2xe3rd_i/signal_adapter_x2zy1bvr \
+  --seed 20261013 --device cuda
+```
+
+输出`signal_sampling_*`：`sampling_report.json`、`generated_scenes.pt`、`generated_normalized_latents.pt`、`sampling_rng_trace.json`、`agent_slot_differences.csv`及baseline/stop/go/comparison.svg。SVG直接打开；不要求Matplotlib、CairoSVG或图像生成服务。
+
+`signal_sampling_pipeline_verified`只验收完整采样、配对、冻结与解码/输出链路。响应差异与一次原版重复波动的比较是描述性结果，不是统计验证，生成质量标志始终false。当前adapter只在一个场景t_agent=50/t_lane=0、固定噪声上学习5步，在其他扩散步的表现可能退化；不能预先保证GO更快、红灯遵循或泛化。官方eval.py不自动消费adapter；本次完整接入限定在新研究入口。E6历史结果仍由原入口维护。
