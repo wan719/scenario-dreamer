@@ -25,3 +25,27 @@
 几何血缘的下一阶段接口应逐层保存：原始 Lane ID 与点索引、同次压缩的 Group 成员及拼接偏移；FoV 点掩码对应的**有序原索引和连续段边界**；两次重采样每个输出点对应的输入线段端点、插值权重或弧长位置，并显式处理重复点造成的零长线段；Partition 每个新 ID 的父 ID、切片 `[start,end)` 和共享交叉点；最终图顺序、实际排序/截断索引、训练行排列、场景时间步与 regular/partitioned 类型。FoV 若保留不连续的点，当前实现会把它们相邻重采样，单一原始点区间不足以表达这段新连线。
 
 上述 E1 阶段仅有合成样本；后续已针对固定 Scenario `637f20cafde22ff8`、record 0、t=10 完成 E3–E5-A 的真实证据审计。E5-B 的独立候选投影见 [Schema](e5b_projection_schema.md) 与 [固定场景报告](e5b_report.md)。这些证据仅适用于该场景和时刻，最终 20 点的原始 Stop 身份仍未证实，不代表通用数据链已贯通。
+
+## E6：真实DiT信号残差与短步学习实验
+
+`signal_lane_adapter.py`将九状态one-hot、归一化Stop XY和有效点Mask选择的局部几何均值组成13维输入，经13→64→DiT道路hidden维度的MLP输出残差；末层零初始化。无有效点、inactive信号和不受支持的道路行不产生残差；同一行的多个有效信号取均值。
+
+`LaneSignalResidual`在现有lane_embedder输出后临时挂接分支，进入原有位置编码与注意力；退出上下文会移除hook。原AE/LDM源码和checkpoint格式保持原状。新增adapter权重单独保存，不会自动接入原eval.py。
+
+输入必须来自已核验的单一regular场景record0/t=10。服务器已有AE→LDM排序、53个有效点、预训练strict加载和EMA去噪证据；实验入口再次检查源码blob、checkpoint/AE来源SHA、原始与归一化latent、固定道路输入、时间步及Mask。
+
+测试（PyTorch 2.2、PyG 2.6.1、OmegaConf、Hydra、torch-ema）：
+```bash
+python -m unittest research.traffic_logic.test_signal_lane_adapter research.traffic_logic.test_e6_signal_adapter_probe -v
+```
+
+服务器实验：
+```bash
+OMP_NUM_THREADS=1 /root/autodl-tmp/conda-envs/scenario-dreamer/bin/python -m research.traffic_logic.e6_signal_adapter_probe \
+  --baseline-dir /root/autodl-tmp/e5e_t10_2xe3rd_i/model_resume_3744mega \
+  --steps 5 --learning-rate 0.001 --device cuda
+```
+
+输出到同级`signal_adapter_*`目录：`signal_adapter_report.json`记录基线一致性、真实hook调用、梯度、条件响应与冻结检查；`adapter_probe.pt`保存adapter参数、实际预测、残差及训练噪声。
+
+成功标志`signal_adapter_probe_verified`仅表示模型实际读取条件、分支可学习且对合成灯态扰动有响应。训练目标是固定时间步、AE均值latent、固定道路下的车辆epsilon MSE，并非官方完整训练协议。GO扰动是接口敏感性测试；单场景六条停止类信号不能证明交通遵循、生成质量或闯红灯率，代码不执行完整采样。原模型参数冻结，`weights_updated`仅指adapter。
