@@ -56,25 +56,18 @@ class ObservedSignalDiT(nn.Module):
 
 
 @torch.no_grad()
-def sample_paired(ldm, data, adapter, condition, seed=20261013, progress=None, on_variant=None):
-    """Return four normalized latent pairs and reproducibility diagnostics.
-
-    The second baseline estimates accumulated numerical variation; it is not
-    another experimental condition. No training or time schedule override occurs.
-    """
+def sample_condition_variants(ldm, data, adapter, conditions, seed=20261013, progress=None, on_variant=None):
+    """Run named conditions through the same official loop and paired RNG stream."""
+    conditions = list(conditions)
+    labels = [label for label, _ in conditions]
+    if not labels or len(set(labels)) != len(labels) or any(not isinstance(x, str) or not x for x in labels):
+        raise ValueError('Expected unique nonempty variant names')
     ldm.eval().requires_grad_(False)
     adapter.eval().requires_grad_(False)
     device = next(ldm.parameters()).device
     data = data.clone().to(device)
     if data.num_graphs != 1:
         raise ValueError('This paired probe requires one scene')
-    condition = tuple(value.to(device) for value in condition)
-    features, mask, geometry, active = condition
-    changed = features.clone()
-    changed[active, :9] = 0
-    changed[active, 6] = 1
-    conditions = [('baseline', None), ('baseline_repeat', None),
-                  ('stop', condition), ('go', (changed, mask, geometry, active))]
     base = ldm.model
     versions = tuple(p._version for p in ldm.parameters())
     adapter_versions = tuple(p._version for p in adapter.parameters())
@@ -88,6 +81,7 @@ def sample_paired(ldm, data, adapter, condition, seed=20261013, progress=None, o
                    'weights_updated': False, 'variants': traces})
     devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == 'cuda' else []
     for label, selected in conditions:
+        selected = None if selected is None else tuple(value.to(device) for value in selected)
         if on_variant is not None:
             on_variant(label)
         observed = ObservedSignalDiT(base, adapter, selected, device, report).eval()
@@ -113,6 +107,7 @@ def sample_paired(ldm, data, adapter, condition, seed=20261013, progress=None, o
             observed.trace['initial_agent_noise_sha256'] = hashlib.sha256(observed.initial_agent_noise.numpy().tobytes()).hexdigest()
             if (observed.trace['conditional_calls'] != ldm.n_timesteps
                     or observed.trace['unconditional_calls'] != ldm.n_timesteps
+                    or observed.trace['injection_calls'] != (ldm.n_timesteps if selected is not None else 0)
                     or observed.trace['lane_timesteps'] != list(range(ldm.n_timesteps - 1, -1, -1))):
                 raise AssertionError('Official CFG call count or schedule changed')
             outputs[label] = (agents.cpu(), lanes.cpu())
@@ -121,18 +116,35 @@ def sample_paired(ldm, data, adapter, condition, seed=20261013, progress=None, o
             report['completed_variants'] = list(outputs)
         finally:
             ldm.model = base
-    anchor = traces['baseline']
+    anchor_label = labels[0]
+    anchor = traces[anchor_label]
     for label in traces:
-        torch.testing.assert_close(initial[label], initial['baseline'], rtol=0, atol=0)
+        torch.testing.assert_close(initial[label], initial[anchor_label], rtol=0, atol=0)
         for key in ('rng_call_digests', 'rng_final_digest'):
             if traces[label][key] != anchor[key]:
                 raise AssertionError('Paired Torch random streams differ: ' + label)
     unchanged = (tuple(p._version for p in ldm.parameters()) == versions
                  and tuple(p._version for p in adapter.parameters()) == adapter_versions
                  and all(p.grad is None for p in ldm.parameters())
+                 and all(p.grad is None for p in adapter.parameters())
                  and tuple(ldm.state_dict()) == state_keys)
     if not unchanged:
         raise AssertionError('Frozen pretrained model or adapter changed')
+    report.update({'paired_torch_noise_verified': True, 'pretrained_parameters_unchanged': True,
+                   'adapter_parameters_unchanged': True, 'full_sampling_run': True})
+    return outputs, report
+
+
+@torch.no_grad()
+def sample_paired(ldm, data, adapter, condition, seed=20261013, progress=None, on_variant=None):
+    """E7 compatibility: original repeat, adapter STOP and all-active synthetic GO."""
+    features, mask, geometry, active = condition
+    changed = features.clone()
+    changed[active, :9] = 0
+    changed[active, 6] = 1
+    conditions = [('baseline', None), ('baseline_repeat', None),
+                  ('stop', condition), ('go', (changed, mask, geometry, active))]
+    outputs, report = sample_condition_variants(ldm, data, adapter, conditions, seed, progress, on_variant)
     numerical_delta = float((outputs['baseline'][0] - outputs['baseline_repeat'][0]).abs().max())
     threshold = max(1e-5, 5 * numerical_delta)
     response = {label: float((outputs[a][0] - outputs[b][0]).abs().max())

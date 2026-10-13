@@ -72,3 +72,51 @@ OMP_NUM_THREADS=1 /root/autodl-tmp/conda-envs/scenario-dreamer/bin/python -m res
 输出`signal_sampling_*`：`sampling_report.json`、`generated_scenes.pt`、`generated_normalized_latents.pt`、`sampling_rng_trace.json`、`agent_slot_differences.csv`及baseline/stop/go/comparison.svg。SVG直接打开；不要求Matplotlib、CairoSVG或图像生成服务。
 
 `signal_sampling_pipeline_verified`只验收完整采样、配对、冻结与解码/输出链路。响应差异与一次原版重复波动的比较是描述性结果，不是统计验证，生成质量标志始终false。当前adapter只在一个场景t_agent=50/t_lane=0、固定噪声上学习5步，在其他扩散步的表现可能退化；不能预先保证GO更快、红灯遵循或泛化。官方eval.py不自动消费adapter；本次完整接入限定在新研究入口。E6历史结果仍由原入口维护。
+# E8: single-signal interventions and response locality
+
+`e8_signal_locality_probe` reuses the E6 saved adapter and E7 verified EMA/AE
+loaders. It runs eight paired official lane-conditioned samples: STOP,
+repeat STOP, and one synthetic GO for each of the six active signals. Exactly
+one state row changes in each intervention; other states, Stop Point coordinates,
+source masks, roads, pretrained model, AE and adapter weights remain fixed.
+The shared sampler preserves E7's four-variant API and checks every conditional/
+unconditional call, original schedule, per-call/final RNG, fixed road latents and
+frozen parameter versions. Signal injection occurs only in conditional calls.
+
+Example using the witnessed server paths:
+
+```bash
+OMP_NUM_THREADS=1 /root/autodl-tmp/conda-envs/scenario-dreamer/bin/python -m research.traffic_logic.e8_signal_locality_probe \
+  --baseline-dir /root/autodl-tmp/e5e_t10_2xe3rd_i/model_resume_3744mega \
+  --adapter-dir /root/autodl-tmp/e5e_t10_2xe3rd_i/signal_adapter_x2zy1bvr \
+  --signals-json /root/autodl-tmp/e5e_t10_2xe3rd_i/batch_woet5bnh/signals_g18l2b45/signal_batch_candidates.json \
+  --mask-report /root/autodl-tmp/e5e_t10_2xe3rd_i/batch_woet5bnh/signals_g18l2b45/mask_rld3djx0/signal_mask_report.json \
+  --seed 20261013 --device cuda
+```
+
+Hash-bound signal/source evidence and the witnessed LDM permutation define
+input road geometry. Exploratory approach candidates require distance <=2 m,
+heading difference <=30 degrees, aligned-candidate distance margin >=0.5 m,
+positive arc distance before the projected Stop Point, and two uniquely owned,
+verified source endpoints without uncertainty reasons. Upstream source segments
+in the same compact road are included; signal source masks are not vehicle filters.
+These are geometric candidates, not ground-truth lane membership. This entry
+supports only the witnessed one-scene/t10/64 m coordinate schema.
+
+`signal_slot_differences.csv` and `signal_group_differences.csv` compare each
+single GO with STOP using a **fixed STOP population**: target approach candidates,
+other active approaches, and remaining slots. Remaining does not mean known
+uncontrolled. Both approach-label and candidate-row switches are retained, even
+when both approach labels are absent. Empty groups produce count 0 and null/blank
+metrics. One STOP repeat sets descriptive floors per metric of
+max(0.001 in its physical unit, 5*maximum repeat difference); these are not
+statistical tests or compliance thresholds. Signed speed differences are scene
+contrasts, not acceleration. No minimum response/locality ratio is required for
+pipeline completion; absence of target candidates is explicit in each result.
+
+Outputs also include `locality_report.json`, `approach_associations.json`, saved
+normalized/physical scenes, exact RNG traces, and six `comparison_<lane>.svg`
+views. Only the changed signal marker is green. Pipeline success does not claim
+traffic-validity, generated quality or red-light compliance: Stop Points are not
+stop lines, slots are not real track IDs, and `quality_improvement_verified` is
+always false. This stage performs no training.

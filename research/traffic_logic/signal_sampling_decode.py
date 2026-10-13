@@ -68,7 +68,7 @@ def scene_diagnostics(scene, reference_roads, fov):
             'decoded_road_vs_input_max_m':float(distances.max())}
 
 
-def _panel(scene, title, condition, scale, go=False):
+def _panel(scene, title, condition, scale, go=False, go_signal_indices=None):
     # Geometry is drawn in ego XY metres; no plotting package is required on the server.
     fov = float(scale['fov'])
     def point(x,y):
@@ -86,9 +86,11 @@ def _panel(scene, title, condition, scale, go=False):
         coordinates = ' '.join(f'{x:.2f},{y:.2f}' for x,y in (point(*xy) for xy in lane))
         body.append(f'<polyline points="{coordinates}" fill="none" stroke="#94a3b8" stroke-width="1.2"/>')
     features, _, _, active = condition
-    for stop in features[active,9:11]:
+    for index in active.nonzero().flatten().tolist():
+        stop = features[index,9:11]
         x,y = point(*(stop*fov/2))
-        color = '#16a34a' if go else '#dc2626'
+        changed = go if go_signal_indices is None else index in go_signal_indices
+        color = '#16a34a' if changed else '#dc2626'
         body.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3" fill="{color}"><title>Stop point; not a stop line</title></circle>')
     palette = ('#2563eb','#9333ea','#d97706')
     for slot,state in enumerate(scene['agent_states']):
