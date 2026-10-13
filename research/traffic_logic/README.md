@@ -48,4 +48,8 @@ OMP_NUM_THREADS=1 /root/autodl-tmp/conda-envs/scenario-dreamer/bin/python -m res
 
 输出到同级`signal_adapter_*`目录：`signal_adapter_report.json`记录基线一致性、真实hook调用、梯度、条件响应与冻结检查；`adapter_probe.pt`保存adapter参数、实际预测、残差及训练噪声。
 
+2026-10-13 A100原模型重复性检查发现FP32道路预测两两最大绝对差4.083e-6。因此仅预测输出比较改用rtol=1e-5、atol=1e-5，输入latent、源码及SHA证据仍按原规则核验。容差只用于数值一致性，不用于宣称条件有效。
+
+条件响应采用原版、训练后、合成GO三组各3次前向；车辆输出的组内两两最大差记为jitter，门槛为max(1e-5, 5×三组最大jitter)。原版→训练后、训练后→合成GO的全部跨组配对差异（每对取最大绝对差）的最小值都必须超过门槛。否则保存已训练adapter与预测，报告signal_adapter_probe_no_state_response。三组重复预测、实测波动、门槛和差异均留存；本条件只是保守接口探测，三次重复不能给出统计显著性或泛化结论。
+
 成功标志`signal_adapter_probe_verified`仅表示模型实际读取条件、分支可学习且对合成灯态扰动有响应。训练目标是固定时间步、AE均值latent、固定道路下的车辆epsilon MSE，并非官方完整训练协议。GO扰动是接口敏感性测试；单场景六条停止类信号不能证明交通遵循、生成质量或闯红灯率，代码不执行完整采样。原模型参数冻结，`weights_updated`仅指adapter。

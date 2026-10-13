@@ -60,6 +60,32 @@ def small_model_fixture(lanes=3, agents=2):
 
 
 class RealDiTProbeTest(unittest.TestCase):
+    def test_audited_fp32_replay_noise_does_not_block_learning(self):
+        ldm, reference, condition = small_model_fixture()
+        for key in ('conditional_lane', 'unconditional_lane'):
+            value = reference[key].clone()
+            index = value.abs().flatten().argmin()
+            value.flatten()[index] += 4.1e-6
+            reference[key] = value
+        report, _ = run_learning_probe(ldm, reference, condition, steps=2, learning_rate=0.01)
+        self.assertTrue(report['baseline_replayed'])
+        self.assertEqual(report['steps_completed'], 2)
+
+    def test_noise_sized_positive_changes_are_not_verified_as_condition_response(self):
+        ldm, reference, condition = small_model_fixture()
+        report, _ = run_learning_probe(ldm, reference, condition, steps=1, learning_rate=1e-7)
+        self.assertGreater(report['updated_agent_max_abs'], 0)
+        self.assertFalse(report['condition_response_verified'])
+
+    def test_materially_wrong_historical_prediction_is_still_rejected(self):
+        ldm, reference, condition = small_model_fixture()
+        reference['conditional_lane'] = reference['conditional_lane'] + 1e-3
+        progress = {'model_condition_injected': False, 'weights_updated': False}
+        with self.assertRaises(AssertionError):
+            run_learning_probe(ldm, reference, condition, progress=progress)
+        self.assertFalse(progress['model_condition_injected'])
+        self.assertFalse(progress['weights_updated'])
+
     def test_reference_lane_order_must_match_condition_evidence(self):
         ldm, reference, _ = small_model_fixture()
         arrays = {'lane_mu': reference['data']['lane'].x.numpy().copy(),

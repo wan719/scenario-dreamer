@@ -6,6 +6,7 @@ import argparse
 import copy
 import gc
 import hashlib
+import itertools
 import json
 import os
 import pickle
@@ -21,6 +22,13 @@ from torch_ema import ExponentialMovingAverage
 
 from nn_modules.ldm import LDM
 from research.traffic_logic.signal_lane_adapter import SignalLaneAdapter, LaneSignalResidual
+
+# A100 audit: unchanged FP32 lane forwards differed by up to 4.083e-6.
+# This floor leaves a bounded margin; latent/source checks retain their own tolerances.
+PREDICTION_RTOL = 1e-5
+PREDICTION_ATOL = 1e-5
+RESPONSE_REPEATS = 3
+RESPONSE_NOISE_MULTIPLIER = 5.0
 
 
 def sha256(path):
@@ -69,6 +77,10 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
     if steps < 1 or not 0 < learning_rate <= 0.1:
         raise ValueError("Require positive steps and learning rate <= 0.1")
     report = {} if progress is None else progress
+    report['numerical_policy'] = {
+        'prediction_rtol': PREDICTION_RTOL, 'prediction_atol': PREDICTION_ATOL,
+        'response_repeats': RESPONSE_REPEATS, 'response_absolute_floor': PREDICTION_ATOL,
+        'response_noise_multiplier': RESPONSE_NOISE_MULTIPLIER}
     device = next(ldm.parameters()).device
     ldm.eval().requires_grad_(False)
     parameter_versions = tuple(p._version for p in ldm.parameters())
@@ -96,17 +108,36 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
             raise AssertionError("Expected one actual lane-embedding injection per DiT call")
         return output, hook.calls
 
+    def repeat_predictions(selected_condition=None):
+        outputs, calls = [], 0
+        for _ in range(RESPONSE_REPEATS):
+            output, count = predict(xa, selected_condition)
+            if not all(torch.isfinite(value).all() for value in output):
+                raise AssertionError("Non-finite repeated prediction")
+            outputs.append(output)
+            calls += count
+        return outputs, calls
+
+    def prediction_close(actual, expected):
+        torch.testing.assert_close(actual, expected, rtol=PREDICTION_RTOL, atol=PREDICTION_ATOL)
+
     with torch.no_grad():
-        baseline, _ = predict(xa)
-        for actual, key in zip(baseline, ("conditional_agent", "conditional_lane")):
-            torch.testing.assert_close(actual, reference[key].to(device), rtol=1e-5, atol=1e-6)
+        baseline_repeats, _ = repeat_predictions()
+        baseline = baseline_repeats[0]
+        for output in baseline_repeats:
+            for actual, key in zip(output, ("conditional_agent", "conditional_lane")):
+                prediction_close(actual, reference[key].to(device))
         unconditional, _ = predict(xa, unconditional=True)
         for actual, key in zip(unconditional, ("unconditional_agent", "unconditional_lane")):
-            torch.testing.assert_close(actual, reference[key].to(device), rtol=1e-5, atol=1e-6)
+            prediction_close(actual, reference[key].to(device))
         initial, zero_calls = predict(xa, condition)
         for before, after in zip(baseline, initial):
-            torch.testing.assert_close(after, before, rtol=1e-5, atol=1e-6)
+            prediction_close(after, before)
     report.update({
+        "historical_replay_max_abs": {
+            role: max(float((output[index] - reference['conditional_' + role].to(device)).abs().max())
+                      for output in baseline_repeats)
+            for index, role in enumerate(('agent', 'lane'))},
         "baseline_replayed": True, "zero_residual_baseline_verified": True,
         "zero_residual_agent_max_abs": float((initial[0] - baseline[0]).abs().max()),
         "adapter_parameter_count": sum(p.numel() for p in adapter.parameters()),
@@ -148,27 +179,29 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
                        "steps_completed": step + 1})
 
     with torch.no_grad():
-        trained, calls = predict(xa, condition)
+        trained_repeats, calls = repeat_predictions(condition)
+        trained = trained_repeats[0]
         trained_noisy, extra_calls = predict(noised_agents, condition)
         report["hook_calls"] += calls + extra_calls
         loss_after = float((trained_noisy[0] - target_noise).square().mean())
         changed_features = features.clone()
         changed_features[active, :9] = 0
         changed_features[active, 6] = 1  # Synthetic GO; sensitivity test only.
-        changed, calls = predict(xa, (changed_features, masks, geometry, active))
+        changed_repeats, calls = repeat_predictions((changed_features, masks, geometry, active))
+        changed = changed_repeats[0]
         report["hook_calls"] += calls
         inactive_changed = features.clone()
         inactive_changed[~active] += 0.37
         ignored, calls = predict(xa, (inactive_changed, masks, geometry, active))
         report["hook_calls"] += calls
-        torch.testing.assert_close(ignored[0], trained[0], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(ignored[1], trained[1], rtol=1e-5, atol=1e-6)
+        prediction_close(ignored[0], trained[0])
+        prediction_close(ignored[1], trained[1])
         disabled, _ = predict(xa)
         for before, after in zip(baseline, disabled):
-            torch.testing.assert_close(after, before, rtol=1e-5, atol=1e-6)
+            prediction_close(after, before)
         unconditional_after, _ = predict(xa, condition, unconditional=True)
         for before, after in zip(unconditional, unconditional_after):
-            torch.testing.assert_close(after, before, rtol=1e-5, atol=1e-6)
+            prediction_close(after, before)
         residual = adapter(*condition)
         support = (masks.any(-1) & active[:, None]).any(0)
         if torch.count_nonzero(residual[~support]):
@@ -183,6 +216,15 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
         raise AssertionError("Frozen pretrained model changed")
     updated_delta = float((trained[0] - baseline[0]).abs().max())
     state_delta = float((changed[0] - trained[0]).abs().max())
+    groups = {'baseline': baseline_repeats, 'trained': trained_repeats, 'changed_state': changed_repeats}
+    jitters = {label: max(float((a[0] - b[0]).abs().max())
+                         for a, b in itertools.combinations(outputs, 2))
+               for label, outputs in groups.items()}
+    response_threshold = max(PREDICTION_ATOL, RESPONSE_NOISE_MULTIPLIER * max(jitters.values()))
+    updated_min_delta = min(float((a[0] - b[0]).abs().max())
+                            for a in baseline_repeats for b in trained_repeats)
+    state_min_delta = min(float((a[0] - b[0]).abs().max())
+                          for a in trained_repeats for b in changed_repeats)
     report.update({
         "model_condition_injected": True, "adapter_weights_updated": True,
         "pretrained_parameters_unchanged": unchanged,
@@ -193,7 +235,13 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
         "loss_improved_in_probe": loss_after < loss_before,
         "updated_agent_max_abs": updated_delta,
         "state_perturbation_agent_max_abs": state_delta,
-        "condition_response_verified": updated_delta > 0 and state_delta > 0,
+        "agent_repeat_max_abs": jitters,
+        "condition_response_threshold": response_threshold,
+        "updated_agent_min_pairwise_max_abs": updated_min_delta,
+        "state_perturbation_agent_min_pairwise_max_abs": state_min_delta,
+        "updated_response_above_noise": updated_min_delta > response_threshold,
+        "state_response_above_noise": state_min_delta > response_threshold,
+        "condition_response_verified": updated_min_delta > response_threshold and state_min_delta > response_threshold,
         "counterfactual_scope": "synthetic GO perturbation; no traffic-validity claim",
         "steps": steps, "learning_rate": learning_rate, "seed": seed,
         "objective": "fixed agent epsilon MSE at saved timestep; AE mean latents; fixed roads",
@@ -206,6 +254,9 @@ def run_learning_probe(ldm, reference, condition, steps=5, learning_rate=0.001,
         "changed_state_agent_noise": changed[0].cpu(), "lane_residual": residual.cpu(),
         "target_noise": target_noise.cpu(), "noised_agents": noised_agents.cpu()
     }
+    artifacts['response_repeat_predictions'] = {
+        label: [{'agent': output[0].cpu(), 'lane': output[1].cpu()} for output in outputs]
+        for label, outputs in groups.items()}
     return report, artifacts
 
 
